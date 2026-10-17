@@ -1,5 +1,5 @@
 {
-  "name": "pi-router",
+  "name": "orq-pi-router",
   "version": "1.0.0",
   "description": "Configurable model routing for Pi with Von classification across providers",
   "main": "index.ts",

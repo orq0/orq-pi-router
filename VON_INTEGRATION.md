@@ -1,6 +1,6 @@
 # Von integration
 
-Von is the classifier in the intended AUTO routing architecture. It classifies the task among available user-configured models; pi-router follows the selected target and switches Pi's active provider/model. Von does not execute tasks.
+Von is the classifier in the intended AUTO routing architecture. It classifies the task among available user-configured models; orq-pi-router follows the selected target and switches Pi's active provider/model. Von does not execute tasks.
 
 ## Candidate construction
 

@@ -1,8 +1,8 @@
-![pi-router](./pi-router.jpg)
+![orq-pi-router](./pi-router.jpg)
 
-# pi-router
+# orq-pi-router
 
-Automatic model routing for [Pi](https://github.com/earendil-works/pi). Users configure a set of models from any Pi provider; Von classifies each task among those candidates, and pi-router switches Pi to the selected model.
+Automatic model routing for [Pi](https://github.com/earendil-works/pi). Users configure a set of models from any Pi provider; Von classifies each task among those candidates, and orq-pi-router switches Pi to the selected model.
 
 For example, AUTO can choose among a local model, Luna for lightweight work, Sol for everyday coding, and ASTRA for difficult reasoning. Models from other providers work through the same configuration. No provider or model name requires a source-code change.
 
@@ -16,7 +16,7 @@ Pi's existing `/model` selector and the router's slash commands control the same
 
 ```mermaid
 flowchart TD
-    PI[Pi: model selector and slash commands] --> R[pi-router: routing mode and state]
+    PI[Pi: model selector and slash commands] --> R[orq-pi-router: routing mode and state]
     T[New task] --> R
     R --> M{Current mode}
     M -->|AUTO: default| V[Von classifies among available configured targets]
@@ -71,7 +71,7 @@ Von is required for AUTO and is bypassed in manual modes. The router sends class
 
 ```mermaid
 flowchart LR
-    R[pi-router in AUTO] -->|HTTP POST /v1/systemone| V[Von service: separate installation and weights]
+    R[orq-pi-router in AUTO] -->|HTTP POST /v1/systemone| V[Von service: separate installation and weights]
     V -->|Choice, probabilities, confidence| R
     R -->|Apply valid choice| P[Pi model selection]
     P --> T[Configured task model: LOCAL, ASTRA, SOL, LUNA, or another provider]
@@ -235,7 +235,7 @@ Routing state is persisted as Pi custom session entries, including target aliase
 
 ```mermaid
 flowchart TD
-    PI[Pi: model registry, credentials, session, and tools] --> R[pi-router: mode gate, state, validation, and model switching]
+    PI[Pi: model registry, credentials, session, and tools] --> R[orq-pi-router: mode gate, state, validation, and model switching]
     R -->|AUTO: task and candidate descriptions| V[Von: external task classifier]
     V -->|Chosen target and diagnostic probabilities| R
     V -->|Missing or invalid decision| B[Block AUTO task]
@@ -248,7 +248,7 @@ flowchart TD
 ```
 
 - **Pi** owns provider configuration, authentication, the active model, and task execution.
-- **pi-router** owns the mode gate, candidate validation, task blocking, model switching, and saved routing state.
+- **orq-pi-router** owns the mode gate, candidate validation, task blocking, model switching, and saved routing state.
 - **Von** decides which available configured target receives each new AUTO task. Probabilities and confidence are diagnostic metadata.
 - **The selected task model** performs the work. In manual modes, the user chooses it directly and Von is bypassed.
 
