@@ -10,21 +10,52 @@ For example, AUTO can choose among a local model, Luna for lightweight work, Sol
 >
 > This experimental personal project may change significantly and may not cover every use case. Use it as a starting point and adapt it for your workflow.
 
-## Architecture
+## How it works
+
+Pi's existing `/model` selector and the router's slash commands control the same routing mode. A new session starts in AUTO; a resumed session restores its saved mode.
 
 ```mermaid
 flowchart TD
-    T[Task] --> M{Selected mode}
-    M -->|AUTO - default| V[Von classifies the task]
-    V -->|Valid choice| A[Use Von's chosen model]
-    V -->|Unavailable or invalid| B[Block the task and show an error]
-    M -->|LOCAL| L[Use the pinned local model]
-    M -->|ASTRA / SOL / LUNA / other| P[Use the pinned model]
+    PI[Pi: model selector and slash commands] --> R[pi-router: routing mode and state]
+    T[New task] --> R
+    R --> M{Current mode}
+    M -->|AUTO: default| V[Von classifies among available configured targets]
+    V -->|Valid choice| S[Switch Pi to exactly that provider/model]
+    V -->|Unavailable or invalid| B[Block task and show an error]
+    S -->|Switch accepted| E[Pi executes task on selected model]
+    S -->|Switch rejected| B
+    M -->|LOCAL| L[Pinned local model]
+    M -->|ASTRA / SOL / LUNA / other| P[Pinned named model]
+    L --> E
+    P --> E
 ```
 
 Pi owns provider connections, credentials, tools, and task execution. Von classifies the task; it does not execute it. AUTO requires a valid decision from Von for every new task and follows that choice directly. An unavailable, disabled, invalid, or timed-out classifier blocks the task before execution. There is no automatic fallback to LOCAL, another target, or a previous task's decision.
 
 Manual modes bypass Von entirely. `/local`, `/astra`, `/sol`, `/luna`, or another configured model command pins that model for all tasks until the user changes mode. Provider failures do not switch a manual model automatically.
+
+### Routing flow
+
+Every new AUTO task requires a fresh Von decision. Once selected, that model handles the task's continuing tool turns.
+
+```mermaid
+flowchart TD
+    T[New task] --> M{Current mode}
+    M -->|Manual| P[Use the model already pinned by the user]
+    M -->|AUTO| C{Von enabled and candidates available?}
+    C -->|No| B[Block task and show an error]
+    C -->|Yes| V[Send task snapshot and candidate criteria to Von]
+    V --> D{Valid response with an offered choice?}
+    D -->|No: error, timeout, or invalid response| B
+    D -->|Yes| S[Ask Pi to select exactly Von's chosen model]
+    S --> A{Model switch accepted?}
+    A -->|No| B
+    A -->|Yes| E[Model selected: routing-only tests end here]
+    P --> E
+    E --> X[Normal use: Pi executes the task]
+```
+
+Manual selection must succeed before a new pin takes effect. Neither AUTO routing errors nor manual provider failures trigger automatic substitution of another model.
 
 ## Requirements
 
@@ -33,6 +64,19 @@ Manual modes bypass Von entirely. `/local`, `/astra`, `/sol`, `/luna`, or anothe
 - A separately installed [Von server](https://github.com/wfzyx/von) and its model weights for AUTO classification.
 
 The extension has no npm runtime dependencies of its own. Installing it does not install Von, download model weights, create model backends, or supply API credentials. Von is a separate open-source project maintained by its own authors.
+
+### Von is a separate service
+
+Von is required for AUTO and is bypassed in manual modes. The router sends classification requests to the configured Von endpoint; task execution goes through Pi's model providers.
+
+```mermaid
+flowchart LR
+    R[pi-router in AUTO] -->|HTTP POST /v1/systemone| V[Von service: separate installation and weights]
+    V -->|Choice, probabilities, confidence| R
+    R -->|Apply valid choice| P[Pi model selection]
+    P --> T[Configured task model: LOCAL, ASTRA, SOL, LUNA, or another provider]
+    V -->|No usable decision| B[Router blocks AUTO task]
+```
 
 ## Configure routing targets
 
@@ -119,6 +163,28 @@ A missing or malformed decision blocks AUTO. An unavailable chosen model or reje
 
 Only targets present in Pi's registry with configured authentication are offered to Von. This checks configuration, not service reachability, model quality, quota, or credential validity at the provider.
 
+### Von decision flow
+
+The original two-target probability policy has been replaced by direct application of Von's choice across the configured candidate list. The function named `policyEngine()` validates the result and maps its choice; it does not apply a probability threshold or choose a different winner.
+
+```mermaid
+flowchart TD
+    T[Task description and session failure signals] --> V[Von classifier]
+    C[Available target aliases and capability descriptions] --> V
+    V --> R[Response: choice, probabilities, confidence]
+    R --> D{Response valid for the offered candidates?}
+    D -->|No| B[Block AUTO task]
+    D -->|Yes| A[Use choice exactly as returned]
+    A --> L[LOCAL]
+    A --> F[ASTRA / SOL / LUNA]
+    A --> O[Any other configured target]
+    L --> S[Pi model selection must succeed before execution]
+    F --> S
+    O --> S
+```
+
+The target branches are examples of the possible choice, not additional decisions by the router. Only the target named by Von is selected. A valid ASTRA choice at 38% is still ASTRA; low confidence does not send it to LOCAL.
+
 ## Load the extension
 
 Add the actual extension file to Pi's settings:
@@ -165,6 +231,29 @@ In a manual mode, every task stays on the selected model, including after errors
 
 Routing state is persisted as Pi custom session entries, including target aliases, mode, failure counters, decision counters, and switch history. Removed target aliases are cleared on restoration. The router does not persist prompts as part of routing state. When Von is enabled, the compact task snapshot is sent to its configured endpoint; provider requests follow each provider's privacy rules.
 
+## Architecture
+
+```mermaid
+flowchart TD
+    PI[Pi: model registry, credentials, session, and tools] --> R[pi-router: mode gate, state, validation, and model switching]
+    R -->|AUTO: task and candidate descriptions| V[Von: external task classifier]
+    V -->|Chosen target and diagnostic probabilities| R
+    V -->|Missing or invalid decision| B[Block AUTO task]
+    R -->|Manual: use pinned model without Von| S[Pi active model]
+    R -->|AUTO: apply valid Von choice| S
+    R -->|Failed AUTO model switch| B
+    S --> L[Local provider: for example, llama.cpp]
+    S --> F[Frontier provider: ASTRA, SOL, LUNA, or another task model]
+    S --> O[Other Pi providers and task models]
+```
+
+- **Pi** owns provider configuration, authentication, the active model, and task execution.
+- **pi-router** owns the mode gate, candidate validation, task blocking, model switching, and saved routing state.
+- **Von** decides which available configured target receives each new AUTO task. Probabilities and confidence are diagnostic metadata.
+- **The selected task model** performs the work. In manual modes, the user chooses it directly and Von is bypassed.
+
+Provider branches show possible destinations; one selected model receives each task. Configured names and provider/model IDs determine the actual destinations.
+
 ## Development
 
 Source files are `index.ts` (Pi integration), `targets.ts` (target configuration), and `von.ts` (classifier adapter and policy).
@@ -201,6 +290,10 @@ npm run test:von:hard
 This opt-in suite uses eight descriptions in `tests/fixtures/high-intelligence-tasks.json`, covering consensus proofs, cryptographic protocol analysis, weak-memory concurrency, Byzantine finality, causal identification, numerical stability, cross-layer incident diagnosis, and authorization noninterference. Each case expects `astra` under its configured role and stops at model selection. It uses the same real Von server and no task-model keys. Unlike the basic integration check, this suite fails when a task reaches the wrong capability tier. The measured results, including direct agreement with Von and expected capability-tier selection, are documented in [VON_INTEGRATION.md](./VON_INTEGRATION.md).
 
 The default `npm test` suite covers routing, configuration validation, direct Von-choice authority, HTTP protocol, manual selection, failed switches, blocked AUTO inputs, manual pinning, and legacy target references. It excludes the opt-in live Von check. Validate real task execution separately only when that becomes part of your test scope.
+
+Recorded validation: **40 deterministic tests pass** and strict type checking passes. In the demanding-task evaluation, **8/8 selections matched Von**, while **1/8 selected the expected ASTRA tier**. Classifier quality remains an open limitation; see [the measured results](./VON_INTEGRATION.md).
+
+See [ROUTER.md](./ROUTER.md) for the standalone router specification, including the mode contract and task lifetime.
 
 ## License
 
