@@ -1,0 +1,42 @@
+[
+  {
+    "name": "Consensus reconfiguration proof",
+    "expectedTarget": "astra",
+    "task": "Design a formally verified membership-reconfiguration protocol for a globally distributed financial ledger. Nodes may crash and recover, messages can be delayed or duplicated, and a network partition can overlap a leader change and a membership change. Derive the quorum-intersection conditions, identify counterexamples to naive old-to-new majority transitions, specify the joint-consensus state machine, and prove linearizability and safety under arbitrary interleavings. State the weakest synchrony assumptions needed for liveness and provide a TLA+ specification with invariants and a model-checking strategy. Reconcile safety, disaster recovery, availability, and bounded operational downtime; do not just recommend an existing algorithm."
+  },
+  {
+    "name": "Cryptographic protocol and key-rotation analysis",
+    "expectedTarget": "astra",
+    "task": "Review a proposed multi-tenant threshold-signature authorization protocol that rotates signing shares across regions while requests remain in flight. A compromised minority of replicas can replay old messages and race key-epoch transitions. Construct a precise adversary model, analyze cross-tenant and cross-epoch replay, prove the necessary domain-separation and quorum-binding properties, and identify whether forward security and uninterrupted availability can both hold under the stated failure model. Derive a corrected protocol, explicitly distinguish cryptographic assumptions from distributed-system assumptions, and explain subtle attack counterexamples and residual risks. This requires original security reasoning and a rigorous protocol argument, not implementation boilerplate."
+  },
+  {
+    "name": "Weak-memory concurrency correctness",
+    "expectedTarget": "astra",
+    "task": "Determine whether a proposed lock-free memory-reclamation scheme is correct under the C++ memory model on ARM64. A reader publishes a hazard pointer after acquiring a node pointer; a writer concurrently unlinks, retires, and reuses the node address. Model the ABA problem, release/acquire versus relaxed atomics, compiler reordering, and object-lifetime rules. Construct a minimal execution graph that violates the claimed safety property or prove that none exists. Then derive the weakest sufficient memory orders and a linearization-point argument while preserving lock freedom. Explain why a stress test passing on x86 does not establish correctness and design a bounded model-checking experiment."
+  },
+  {
+    "name": "Byzantine finality and conflicting quorum analysis",
+    "expectedTarget": "astra",
+    "task": "Analyze the safety and liveness of a Byzantine finality protocol whose weighted validator set changes between epochs. Stake can move during a network partition, honest nodes may observe different activation boundaries, and old signatures remain verifiable. Derive the exact quorum-overlap requirement needed to prevent two conflicting finalized histories, construct an adversarial schedule when that requirement is violated, and prove whether the proposed slashing rule is sufficient. Separate accountable safety from automatic recovery and identify where weak-subjectivity or synchrony assumptions are unavoidable. Compare at least two corrected designs with explicit proofs, failure bounds, and operational tradeoffs."
+  },
+  {
+    "name": "Causal identification under hidden confounding",
+    "expectedTarget": "astra",
+    "task": "Develop a defensible causal analysis for a longitudinal observational study where treatment is time varying, prior treatment affects later confounders, some confounders are unobserved, and measurement is missing not at random. Determine which proposed treatment effects are identifiable and which are not. Construct alternative causal graphs that fit the observed data but imply different intervention effects, state the assumptions required by the g-formula and inverse-probability weighting, and derive a sensitivity or partial-identification analysis using suitable negative controls. Explain when no unbiased point estimate can be justified. Provide mathematical reasoning and falsifiable diagnostics rather than selecting a statistical package."
+  },
+  {
+    "name": "Stiff numerical solver stability proof",
+    "expectedTarget": "astra",
+    "task": "Design and justify a numerical scheme for a stiff reaction-diffusion system on an adaptive mesh with discontinuous coefficients and coupled conservation constraints. The current solver preserves total mass but produces negative concentrations and unstable transients near mesh refinement boundaries. Derive a discretization and time integrator that preserves positivity and conservation, analyze consistency and stability, and state the conditions for convergence. Diagnose whether operator splitting, boundary flux interpolation, or nonlinear-solver tolerances can explain the observed failure. Develop counterexamples and a verification plan that separates modeling error, discretization error, and floating-point error, with explicit computational tradeoffs."
+  },
+  {
+    "name": "Ambiguous cross-layer production failure",
+    "expectedTarget": "astra",
+    "task": "Diagnose a rare distributed production failure after three unsuccessful investigations. Following a kernel and compiler upgrade, a service intermittently acknowledges a write that disappears after failover; logs can be reordered, storage checksums pass, and only ARM64 hosts show the issue. Competing explanations include a weak-memory bug in the replication queue, a write-ahead-log durability ordering error, and an incorrect retry/deduplication invariant. Build a causal model across application, runtime, kernel, and storage layers; derive what evidence would distinguish each explanation; and design a minimal sequence of safe, falsifiable experiments under a strict availability constraint. Reconcile contradictory evidence and propose a recovery design with a correctness argument."
+  },
+  {
+    "name": "Authorization noninterference and migration proof",
+    "expectedTarget": "astra",
+    "task": "Design a zero-downtime migration from a legacy hierarchical access-control system to a distributed policy engine while proving tenant noninterference. Policies combine explicit denies, inherited grants, contextual attributes, stale caches, revocation, and delegated credentials. Concurrent requests may observe mixed old and new versions. Formalize the authorization semantics, find counterexamples to dual-read/union and intersection migration strategies, derive a safe versioning and cache-invalidation protocol, and prove that no migration interleaving grants a capability absent from the intended policy. Resolve the conflict between immediate revocation and availability during partitions, documenting the impossibility boundary and an explicit, defensible tradeoff."
+  }
+]

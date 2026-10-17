@@ -1,6 +1,5 @@
 {
   "url": "http://127.0.0.1:8100",
-  "enabled": false,
-  "timeoutMs": 800,
-  "clearAstraThreshold": 0.7
+  "enabled": true,
+  "timeoutMs": 5000
 }

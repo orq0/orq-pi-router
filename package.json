@@ -1,9 +1,21 @@
 {
   "name": "pi-router",
   "version": "1.0.0",
-  "description": "Automatic model routing (AUTO / LOCAL / ASTRA) for pi via the /model selector",
+  "description": "Configurable model routing for Pi with Von classification across providers",
   "main": "index.ts",
   "pi": {
-    "extensions": ["index.ts"]
+    "extensions": [
+      "index.ts"
+    ]
+  },
+  "type": "module",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "test": "node --experimental-transform-types --test tests/*.test.ts",
+    "test:routing": "node --experimental-transform-types --test tests/router.test.ts",
+    "test:von": "node --experimental-transform-types --test tests/live-von.integration.ts",
+    "test:von:hard": "node --experimental-transform-types --test tests/live-von-hard.integration.ts"
   }
 }

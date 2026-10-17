@@ -1,20 +1,7 @@
 /**
- * pi-router — Von routing adapter (AUTO mode only)
- *
- * This module is the ONLY place in pi-router that knows about Von. It is a thin,
- * isolated boundary:
- *
- *   buildRoutingSnapshot()  — turn existing router state into a compact request
- *   VonClient               — build request, send localhost HTTP, parse + normalize,
- *                             handle timeout/errors (returns null on ANY failure)
- *   policyEngine()          — local-first, escalation-only policy over Von's output
- *   config                  — Von URL + thresholds, read through the router's config
- *
- * Von is an INDEPENDENT local service (started by an external BAT launcher,
- * outside pi-router). pi-router is merely its HTTP client. Von is OPTIONAL: if it
- * is offline, unreachable, slow, or returns malformed data, the router falls back
- * to its existing deterministic + keyword policy. Von never crashes Pi and never
- * affects manual LOCAL/ASTRA.
+ * Von classification adapter for AUTO routing among configured models.
+ * Von is the semantic classifier; network/protocol failures return null so the
+ * router can block AUTO execution. Manual selection bypasses it.
  */
 
 import { readFileSync } from "node:fs";
@@ -23,22 +10,19 @@ import { readFileSync } from "node:fs";
    TYPES
 ========================================================= */
 
-export type VonChoice = "LOCAL" | "ASTRA";
+export type VonChoice = string;
 
 /** Normalized routing data returned by the Von adapter. */
 export interface VonDecision {
   choice: VonChoice;
-  probabilities: {
-    LOCAL: number;
-    ASTRA: number;
-  };
+  probabilities: Record<VonChoice, number>;
   confidence: number;
 }
 
 /** Result of applying the policy engine to Von's decision. */
 export type PolicyOutcome = {
-  /** FINAL routing target. `uncertain` is a sentinel the caller maps to LOCAL. */
-  decision: VonChoice | "uncertain";
+  /** Von's selected alias, or null when no usable decision exists. */
+  decision: VonChoice | null;
   /** Human-readable rationale (surfaced in the status line for transparency). */
   reason: string;
   /** The raw Von decision, preserved for the status line / diagnostics. */
@@ -72,7 +56,7 @@ export interface RoutingSnapshot {
 export interface VonConfig {
   /** Von server base URL (e.g. http://127.0.0.1:8100). */
   url: string;
-  /** Whether Von integration is enabled at all (safe default: off). */
+  /** AUTO requires Von; disabling it leaves manual modes available. */
   enabled: boolean;
   /** Short localhost timeout so a dead Von server cannot stall the agent. */
   timeoutMs: number;
@@ -82,31 +66,18 @@ export interface VonConfig {
    */
   model: string;
   /**
-   * Probability (0..1) at which Von's ASTRA signal is considered "clear" and
-   * overrides the local-first policy. Conservative by design — uncertainty and
-   * borderline results default to LOCAL. Tune after real-world testing.
-   */
-  clearAstraThreshold: number;
-  /**
    * Evaluation criteria keyed by option name, sent as the System One question's
-   * `criteria`. Operators can retune the engine's LOCAL/ASTRA bias here without
-   * changing code. Defaults to the terse option-name values.
+   * `criteria`. Per-alias entries override configured target descriptions.
+   * The binary defaults remain available for direct VonClient callers.
    */
   criteria: Record<VonChoice, string>;
 }
 
 export const DEFAULT_VON_CONFIG: VonConfig = {
   url: "http://127.0.0.1:8100",
-  enabled: false,
-  timeoutMs: 800,
+  enabled: true,
+  timeoutMs: 5000,
   model: "von-latest",
-  // Conservative: ASTRA must be clearly indicated before overriding LOCAL.
-  // The local Von engine's answer probabilities cluster near 0.55-0.73 for a
-  // discriminating task, so this is set to just-above half: the *dominant* class
-  // (LOCAL or ASTRA) is treated as a clear signal. This keeps the escalation-only
-  // policy intact (uncertainty still defaults to LOCAL) while letting the real
-  // engine's ASTRA signal through when it is genuinely dominant.
-  clearAstraThreshold: 0.65,
   criteria: { LOCAL: "LOCAL", ASTRA: "ASTRA" },
 };
 
@@ -119,7 +90,7 @@ export const DEFAULT_VON_CONFIG: VonConfig = {
  * one place (not scattered across the codebase) and is easy to retune.
  */
 export const ROUTING_INSTRUCTION =
-  "You are a model-routing decision system. Choose LOCAL for routine, well-defined implementation tasks that can be completed with ordinary coding, straightforward tool use, or existing patterns. Choose ASTRA only when the task requires substantially deeper reasoning, difficult architecture or design decisions, security-sensitive analysis, ambiguous requirements that require expert judgment, repeated implementation failures, persistent test failures, repeated tool errors, or diagnosis of a problem that the local coding model has been unable to solve. Do not choose ASTRA merely because a task involves coding, multiple files, or normal debugging. Prefer LOCAL whenever the task is straightforward and the available evidence does not clearly justify escalation.";
+  "Choose which model should undertake the task, using the task, failure signals, and each candidate's description. Select among the offered options only. Prefer an efficient model sufficient for routine work; choose a stronger reasoning model for difficult architecture, security-sensitive analysis, or repeated failures. Return calibrated probabilities for all offered models.";
 
 /**
  * The question key inside the System One `questions` envelope. Fixed value so the
@@ -127,16 +98,7 @@ export const ROUTING_INSTRUCTION =
  */
 export const ROUTING_QUESTION_KEY = "routing";
 
-/**
- * Evaluation criteria keyed by the OPTION NAME.
- *
- * Von's System One engine keys `criteria` by the option it will emit a `choice`
- * for; keys that are not option names produce a malformed `choice` (the router
- * rejects it and falls back). The values are kept intentionally terse and
- * NEUTRAL: the engine weights criterion text, so verbose descriptions bias the
- * answer, whereas terse option-name values yield the most discriminating
- * (least-biased) decisions.
- */
+/** Legacy criteria for callers using VonClient directly without custom targets. */
 export const ROUTING_CRITERIA: Record<VonChoice, string> = {
   LOCAL: "LOCAL",
   ASTRA: "ASTRA",
@@ -159,15 +121,14 @@ export function buildRoutingSnapshot(
     filesChanged?: number;
     securitySensitive?: boolean;
     consecutiveFailures?: number;
-    currentTarget: "local" | "astra" | null;
+    currentTarget: string | null;
   },
-  taskText: string
+  taskText: string,
 ): RoutingSnapshot {
   // `phase` is DERIVED from the existing deterministic failure state, so we never
   // maintain a second independent notion of "what phase we are in".
-  const phase: "normal" | "debugging" = (s.consecutiveFailures ?? 0) > 0
-    ? "debugging"
-    : "normal";
+  const phase: "normal" | "debugging" =
+    (s.consecutiveFailures ?? 0) > 0 ? "debugging" : "normal";
   return {
     task: (taskText || s.task || "").trim().slice(0, 2000),
     phase,
@@ -176,74 +137,44 @@ export function buildRoutingSnapshot(
     testFailures: clampInt(s.testFailures, 0),
     filesChanged: clampInt(s.filesChanged, 0),
     securitySensitive: Boolean(s.securitySensitive),
-    currentModel:
-      s.currentTarget === "astra"
-        ? "ASTRA"
-        : s.currentTarget === "local"
-          ? "LOCAL"
-          : null,
+    currentModel: s.currentTarget?.toUpperCase() ?? null,
   };
 }
 
 function clampInt(n: number | undefined, def: number): number {
-  return Number.isFinite(n as number) && (n as number) > 0 ? (n as number) : def;
+  return Number.isFinite(n as number) && (n as number) > 0
+    ? (n as number)
+    : def;
 }
 
 /* =========================================================
-   POLICY ENGINE (local-first, escalation-only)
+   DECISION VALIDATION (Von owns model selection)
 ========================================================= */
 
-/**
- * Apply the local-first, escalation-only policy to Von's decision.
- *
- *   Von decision
- *        │
- *        ├── Clear ASTRA signal (ASTRA prob >= threshold & dominant) ──► ASTRA
- *        ├── Clear LOCAL signal (LOCAL prob dominant)                  ──► LOCAL
- *        └── Uncertain (below threshold / ambiguous)                   ──► LOCAL
- *
- * Uncertainty ALWAYS defaults to LOCAL. Clarity is judged from the probability
- * distribution, NOT from `confidence` (which is preserved but not decisive).
- */
+/** Validate and pass through Von's choice. Probabilities never override it. */
 export function policyEngine(
   von: VonDecision | null,
-  config: Pick<VonConfig, "clearAstraThreshold">
+  config: { choices?: string[] } = {},
 ): PolicyOutcome {
-  if (!von) {
-    return { decision: "uncertain", reason: "von unavailable; using deterministic policy", von: null };
-  }
-
-  const { choice, probabilities } = von;
-  const { LOCAL: localP, ASTRA: astraP } = probabilities;
-
-  // Judge clarity from the probability DISTRIBUTION, not the engine's `choice`
-  // field. The local Von engine's `choice` is occasionally inconsistent with
-  // its own probabilities (e.g. choice=ASTRA while ASTRA < LOCAL), so the
-  // dominant class + its probability is the robust signal.
-  const clearAstra = astraP >= config.clearAstraThreshold && astraP > localP;
-  if (clearAstra) {
-    return {
-      decision: "ASTRA",
-      reason: `von: ASTRA ${round2(astraP)} (clear ASTRA signal; choice=${choice})`,
+  const decision =
+    von &&
+    normalizeVonDecision(
       von,
+      config.choices ?? Object.keys(von.probabilities ?? {}),
+    );
+  if (!decision) {
+    return {
+      decision: null,
+      reason: von
+        ? "von: invalid decision; no model selected"
+        : "von unavailable; no model selected",
+      von: null,
     };
   }
-
-  // Clear LOCAL signal: LOCAL is the dominant class.
-  const clearLocal = localP > astraP;
-  if (clearLocal) {
-    return {
-      decision: "LOCAL",
-      reason: `von: LOCAL ${round2(localP)} (clear LOCAL signal; choice=${choice})`,
-      von,
-    };
-  }
-
-  // Uncertain → LOCAL.
   return {
-    decision: "uncertain",
-    reason: `von: uncertain (ASTRA ${round2(astraP)} vs ${round2(localP)}); defaulting LOCAL`,
-    von,
+    decision: decision.choice,
+    reason: `von: selected ${decision.choice} (probability ${round2(decision.probabilities[decision.choice])}, confidence ${round2(decision.confidence)})`,
+    von: decision,
   };
 }
 
@@ -266,8 +197,11 @@ function round2(n: number): string {
  */
 export class VonClient {
   constructor(
-    private readonly config: Pick<VonConfig, "url" | "timeoutMs" | "model" | "criteria">,
-    private readonly fetchImpl: typeof fetch = fetch
+    private readonly config: Pick<
+      VonConfig,
+      "url" | "timeoutMs" | "model" | "criteria"
+    >,
+    private readonly fetchImpl: typeof fetch = fetch,
   ) {}
 
   async decide(snapshot: RoutingSnapshot): Promise<VonDecision | null> {
@@ -281,9 +215,10 @@ export class VonClient {
         state: snapshot,
         questions: {
           [ROUTING_QUESTION_KEY]: {
+            type: "choice",
             instructions: ROUTING_INSTRUCTION,
             criteria: this.config.criteria,
-            options: ["LOCAL", "ASTRA"],
+            options: Object.keys(this.config.criteria),
           },
         },
       };
@@ -301,7 +236,10 @@ export class VonClient {
       // The answer lives under `answers[<questionKey>]`; pull it out of the
       // envelope so normalizeVonDecision sees the inner ChoiceAnswer shape
       // ({ choice, probabilities, confidence }).
-      return normalizeVonDecision(extractChoiceAnswer(json));
+      return normalizeVonDecision(
+        extractChoiceAnswer(json),
+        Object.keys(this.config.criteria),
+      );
     } catch {
       // AbortError (timeout), network error, DNS failure, etc.
       return null;
@@ -334,29 +272,33 @@ export function extractChoiceAnswer(envelope: unknown): unknown {
  * the shape is wrong. Defensive on every field so malformed data can never crash
  * the router.
  */
-export function normalizeVonDecision(raw: unknown): VonDecision | null {
-  if (!raw || typeof raw !== "object") return null;
+export function normalizeVonDecision(
+  raw: unknown,
+  choices: string[] = ["LOCAL", "ASTRA"],
+): VonDecision | null {
+  if (!raw || typeof raw !== "object" || !choices.length) return null;
   const r = raw as Record<string, unknown>;
-
-  const choice = r.choice;
-  if (choice !== "LOCAL" && choice !== "ASTRA") return null;
-
-  const probs = r.probabilities;
-  if (!probs || typeof probs !== "object") return null;
-  const p = probs as Record<string, unknown>;
-  const localP = toProb("LOCAL", p.LOCAL);
-  const astraP = toProb("ASTRA", p.ASTRA);
-  if (localP === null || astraP === null) return null;
-
-  const confidence = toConfidence(r.confidence);
-
-  return { choice, probabilities: { LOCAL: localP, ASTRA: astraP }, confidence };
-}
-
-function toProb(label: string, v: unknown): number | null {
-  if (typeof v !== "number" || !Number.isFinite(v)) return null;
-  const n = Math.max(0, Math.min(1, v));
-  return n;
+  if (typeof r.choice !== "string" || !choices.includes(r.choice)) return null;
+  if (!r.probabilities || typeof r.probabilities !== "object") return null;
+  const rawProbabilities = r.probabilities as Record<string, unknown>;
+  if (Object.keys(rawProbabilities).length !== choices.length) return null;
+  const probabilities: Record<string, number> = {};
+  for (const choice of choices) {
+    const value = rawProbabilities[choice];
+    if (
+      typeof value !== "number" ||
+      !Number.isFinite(value) ||
+      value < 0 ||
+      value > 1
+    )
+      return null;
+    probabilities[choice] = value;
+  }
+  return {
+    choice: r.choice,
+    probabilities,
+    confidence: toConfidence(r.confidence),
+  };
 }
 
 function toConfidence(v: unknown): number {
@@ -375,27 +317,31 @@ function toConfidence(v: unknown): number {
  *
  * `overrides` lets callers (and tests) pin specific values without a config file.
  */
-export function loadVonConfig(
-  overrides: Partial<VonConfig> = {}
-): VonConfig {
+export function loadVonConfig(overrides: Partial<VonConfig> = {}): VonConfig {
   const merged: VonConfig = { ...DEFAULT_VON_CONFIG, ...overrides };
   try {
-    const file = new URL("./von.config.json", import.meta.url);
-    const parsed = JSON.parse(readFileSync(file.toString(), "utf-8"));
+    const file =
+      process.env.PI_ROUTER_VON_CONFIG ||
+      new URL("./von.config.json", import.meta.url);
+    const parsed = JSON.parse(readFileSync(file, "utf-8"));
     if (parsed && typeof parsed === "object") {
       const c = parsed as Record<string, unknown>;
       if (typeof c.url === "string" && c.url.trim()) merged.url = c.url.trim();
       if (typeof c.enabled === "boolean") merged.enabled = c.enabled;
-      if (typeof c.timeoutMs === "number" && c.timeoutMs > 0) merged.timeoutMs = c.timeoutMs;
-      if (typeof c.clearAstraThreshold === "number") {
-        merged.clearAstraThreshold = Math.max(0, Math.min(1, c.clearAstraThreshold));
-      }
-      if (typeof c.model === "string" && c.model.trim()) merged.model = c.model.trim();
-      const crit = c.criteria;
+      if (
+        typeof c.timeoutMs === "number" &&
+        Number.isFinite(c.timeoutMs) &&
+        c.timeoutMs > 0
+      )
+        merged.timeoutMs = c.timeoutMs;
+      if (typeof c.model === "string" && c.model.trim())
+        merged.model = c.model.trim();
+      const crit = c.criteria as Record<string, unknown> | undefined;
       if (crit && typeof crit === "object") {
         const mergedCrit: Record<VonChoice, string> = {};
-        for (const key of ["LOCAL", "ASTRA"] as const) {
-          if (typeof crit[key] === "string" && crit[key].trim()) mergedCrit[key] = crit[key];
+        for (const key of Object.keys(crit)) {
+          if (typeof crit[key] === "string" && crit[key].trim())
+            mergedCrit[key] = crit[key];
         }
         if (Object.keys(mergedCrit).length > 0) merged.criteria = mergedCrit;
       }
@@ -443,16 +389,20 @@ export function setVonClientFactoryForTests(fn: VonClientFactory | null): void {
 
 /**
  * The single entry point the router calls. Honors the `enabled` flag: when Von
- * integration is disabled this returns null (pure fallback). When enabled it
+ * integration is disabled this returns null (AUTO must block). When enabled it
  * builds the snapshot, calls the (possibly injected) client, and normalizes.
  * Returns null on ANY failure so the router can fall back safely.
  */
 export async function getVonDecision(
-  snapshot: RoutingSnapshot
+  snapshot: RoutingSnapshot,
+  criteria?: Record<string, string>,
 ): Promise<VonDecision | null> {
   if (!currentConfig.enabled) return null;
   try {
-    return await vonClientFactory(currentConfig).decide(snapshot);
+    return await vonClientFactory({
+      ...currentConfig,
+      criteria: criteria ?? currentConfig.criteria,
+    }).decide(snapshot);
   } catch {
     return null;
   }

@@ -1,0 +1,32 @@
+{
+  "targets": [
+    {
+      "id": "local",
+      "name": "LOCAL",
+      "provider": "local",
+      "model": "model",
+      "description": "Routine tasks suitable for the local model."
+    },
+    {
+      "id": "luna",
+      "name": "Luna",
+      "provider": "openai",
+      "model": "gpt-6-luna",
+      "description": "Quick, simple edits, short explanations, and lightweight tasks."
+    },
+    {
+      "id": "sol",
+      "name": "Sol",
+      "provider": "openai",
+      "model": "gpt-6-sol",
+      "description": "General coding, implementation, debugging, and everyday reasoning."
+    },
+    {
+      "id": "astra",
+      "name": "ASTRA",
+      "provider": "openai",
+      "model": "gpt-6-astra",
+      "description": "Complex architecture, deep reasoning, security analysis, and persistent failures."
+    }
+  ]
+}

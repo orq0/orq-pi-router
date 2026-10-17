@@ -1,23 +1,8 @@
 /**
- * pi-router — Automatic model routing for Pi
- *
- * Exposes three routing modes through Pi's existing `/model` selector:
- *
- *   AUTO   -> Pi decides between LOCAL and ASTRA, per turn, based on the task
- *   LOCAL  -> force provider=local  model=model  (llama.cpp @ 127.0.0.1:1234/v1)
- *   ASTRA  -> force provider=openai model=gpt-6-astra
- *
- * Routing happens entirely at the Pi extension layer. Pi's `/model` selector is
- * never replaced or hidden. AUTO is represented as a *virtual* model registered
- * through the supported `registerProvider()` API so that it shows up as a normal
- * entry in the existing selector (sorted first, because "auto-router" sorts
- * before "local"/"openai"). Selecting AUTO, LOCAL or ASTRA in the selector, or
- * via the `/auto` `/local` `/astra` slash commands, drives the same state.
+ * Automatic routing among user-configured Pi provider/model targets.
+ * AUTO uses Von classification; manual selections and commands pin a model.
  */
 
-import { readdirSync, readFileSync, existsSync } from "node:fs";
-import { join, dirname } from "node:path";
-import { fileURLToPath } from "node:url";
 import type {
   ExtensionAPI,
   ExtensionContext,
@@ -26,25 +11,24 @@ import type {
   TurnEndEvent,
   TurnStartEvent,
   InputEvent,
-  AgentMessage,
+  InputEventResult,
+  BeforeAgentStartEvent,
 } from "@earendil-works/pi-coding-agent";
+import {
+  loadRouterConfig,
+  type RouterConfig,
+  type RoutingTarget,
+} from "./targets.ts";
 import {
   buildRoutingSnapshot,
   policyEngine,
   getVonDecision,
   getVonConfig,
-  setVonConfigForTests,
-  loadVonConfig,
 } from "./von.ts";
 
 /* =========================================================
    CONSTANTS
 ========================================================= */
-
-const PROVIDER_LOCAL = "local";
-const MODEL_LOCAL = "model";
-const PROVIDER_ASTRA = "openai";
-const MODEL_ASTRA = "gpt-6-astra";
 
 // Virtual provider/model that stands in for the AUTO option inside the selector.
 const PROVIDER_AUTO = "auto-router";
@@ -54,8 +38,9 @@ const MODEL_AUTO = "auto-router";
 const STATE_CUSTOM_TYPE = "router-state";
 const DISPLAY_CUSTOM_TYPE = "router-status";
 
-type Mode = "auto" | "local" | "astra";
-type Target = "local" | "astra" | null;
+type Mode = string; // "auto", "manual", or a configured target ID
+type Target = string | null;
+let routerConfig: RouterConfig;
 
 interface RouterState {
   mode: Mode;
@@ -100,34 +85,6 @@ const DEFAULT_STATE: RouterState = {
 };
 
 /* =========================================================
-   PATHS
-========================================================= */
-
-const EXTENSION_DIR = dirname(fileURLToPath(import.meta.url));
-
-/* =========================================================
-   VON (AUTO mode only)
-========================================================= */
-
-// Von is an independent local HTTP service. pi-router is only its client.
-// Configuration comes from the router's normal config mechanism (compiled-in
-// defaults, overridable by von.config.json). Von is DISABLED by default, so the
-// existing deterministic policy is unchanged until it is explicitly enabled —
-// this keeps manual LOCAL/ASTRA and the fallback behavior safe out of the box.
-if (loadVonConfig().enabled) {
-  // Enable at import time only if the config explicitly turned it on. This pins
-  // the live config in the von module so the router and the von adapter agree.
-  setVonConfigForTests(loadVonConfig());
-}
-
-// Signature of the routing state last sent to Von (gating). Von is only called
-// when the routing state has *materially* changed since the last evaluation.
-let routingSignatureCache = "";
-// The last target Von (via the policy engine) resolved to, so an unchanged
-// signature can reuse the decision instead of re-calling Von.
-let lastVonTarget: Target = null;
-
-/* =========================================================
    STATE
 ========================================================= */
 
@@ -137,13 +94,10 @@ let state: RouterState = { ...DEFAULT_STATE };
 // setModel(), Pi emits a "set" model_select that we must not treat as a manual
 // user selection.
 let applyingRouterModel = false;
-// Whether the AUTO target has already been decided for the current turn. Reset
-// at turn_start so each new turn re-decides. currentTarget itself persists
-// across turns and is used as the escalation baseline.
-let decidedThisTurn = false;
-// Captured task text, used to drive AUTO decisions at the turn boundary when
-// the input event fired while the agent was busy (so we cannot switch then).
-let pendingInputText = "";
+// Authorization is scoped to an active task, not a cached choice from an older task.
+let authorizedTask = false;
+let modeRevision = 0;
+let pendingDecision: { target: Target; reason: string } | null = null;
 
 function cloneState(): RouterState {
   return {
@@ -156,9 +110,11 @@ function persistState(): void {
   try {
     // appendEntry writes a custom entry into the session file so routing state
     // survives compaction/rollback. It is never sent to the LLM.
-    (pi as unknown as {
-      appendEntry: (customType: string, data?: unknown) => void;
-    }).appendEntry(STATE_CUSTOM_TYPE, cloneState());
+    (
+      pi as unknown as {
+        appendEntry: (customType: string, data?: unknown) => void;
+      }
+    ).appendEntry(STATE_CUSTOM_TYPE, cloneState());
   } catch {
     /* non-critical */
   }
@@ -189,97 +145,33 @@ function recordSwitch(from: Target, to: Target, reason: string): void {
 // passes the *fully-resolved* registry model (which always carries an `api`).
 // `ctx.modelRegistry.find(provider, id)` is the supported lookup that returns a
 // complete `Model`, so we use it instead of constructing a minimal reference.
-function targetModel(ctx: ExtensionContext, target: Target): ReturnType<
-  typeof ctx.modelRegistry.find
-> {
-  const provider = target === "astra" ? PROVIDER_ASTRA : PROVIDER_LOCAL;
-  const id = target === "astra" ? MODEL_ASTRA : MODEL_LOCAL;
-
-  const resolved = ctx.modelRegistry.find(provider, id);
-  if (resolved) return resolved;
-
-  // Fallback: minimal reference; setModel's own auth validation will fail
-  // loudly with "No API key" rather than silently producing `api: undefined`.
-  return { provider, id } as unknown as ReturnType<typeof ctx.modelRegistry.find>;
+function targetModel(
+  ctx: ExtensionContext,
+  target: Target,
+): ReturnType<typeof ctx.modelRegistry.find> {
+  const configured = routerConfig.targets.find((t) => t.id === target);
+  return configured
+    ? ctx.modelRegistry.find(configured.provider, configured.model)
+    : undefined;
 }
 
-// Whether a target provider is configured with auth (so setModel won't throw
-// "No API key"). Defensive: if the registry API is unavailable, assume it is
-// configured and let setModel's own validation decide.
 function isTargetAvailable(ctx: ExtensionContext, target: Target): boolean {
   try {
-    const reg = (ctx as unknown as {
-      modelRegistry?: { hasConfiguredAuth?: (m: { provider: string }) => boolean };
-    }).modelRegistry;
-    if (reg?.hasConfiguredAuth) {
-      return reg.hasConfiguredAuth(targetModel(ctx, target));
-    }
+    const model = targetModel(ctx, target);
+    return Boolean(
+      model && (ctx.modelRegistry.hasConfiguredAuth?.(model) ?? true),
+    );
   } catch {
-    /* fall through */
+    return false;
   }
-  return true;
 }
 
-/* =========================================================
-   TASK CLASSIFICATION (AUTO policy)
-========================================================= */
-
-// Signals that the task is a deep, cross-cutting "thinking" concern that the
-// local model is typically weaker at, and that a remote reasoning model handles
-// better.
-const ARCHITECTURE_HINTS = [
-  "architecture",
-  "architect",
-  "design",
-  "designs",
-  "refactor",
-  "scal",
-  "performance",
-  "trade",
-  "tradeoff",
-  "tradeoffs",
-  "pattern",
-  "patterns",
-  "system design",
-  "data model",
-  "schema",
-  "overview",
-  "high-level",
-  "high level",
-  "roadmap",
-  "plan the",
-  "how should we",
-  "evaluate",
-  "compare",
-];
-
-// Signals that the task is a concrete, self-contained implementation step that
-// the local model is typically good at.
-const IMPLEMENTATION_HINTS = [
-  "implement",
-  "write a ",
-  "write the ",
-  "fix ",
-  "add a ",
-  "add the ",
-  "build a ",
-  "build the ",
-  "test",
-  "tests",
-  "bug",
-  "bugs",
-  "run the",
-  "run a ",
-  "execute",
-  "small",
-  "quick",
-  "update the ",
-  "update a ",
-];
+function availableTargets(ctx: ExtensionContext): RoutingTarget[] {
+  return routerConfig.targets.filter((t) => isTargetAvailable(ctx, t.id));
+}
 
 // Failure-classification hints for the routing snapshot. Used only to populate
-// the diagnostic counters (testFailures / toolErrors) sent to Von; they do not
-// affect the deterministic escalation path.
+// the diagnostic counters (testFailures / toolErrors) sent to Von.
 const TEST_FAILURE_HINTS = [
   "test",
   "tests",
@@ -301,65 +193,30 @@ const TOOL_ERROR_HINTS = [
   "tool execution",
 ];
 
-function classifyTask(text: string): {
-  score: number;
-  architecture: number;
-  implementation: number;
-} {
-  const lower = ` ${text.toLowerCase()} `;
-  let architecture = 0;
-  let implementation = 0;
-  for (const h of ARCHITECTURE_HINTS) if (lower.includes(` ${h} `)) architecture += 1;
-  for (const h of IMPLEMENTATION_HINTS) if (lower.includes(` ${h} `)) implementation += 1;
-  return { score: architecture - implementation, architecture, implementation };
-}
-
-/**
- * AUTO policy: pick the target model for this turn.
- *
- * 1. Escalate once `consecutiveFailures` reaches the threshold (3): switch away
- *    from the model that just failed. The counter is only reset here (after an
- *    escalation switch) and on a successful turn in `handleTurnEnd` — it is
- *    deliberately NOT reset by `applyTarget`, so it survives the per-turn
- *    decide/switch and can actually reach the threshold.
- * 2. Otherwise classify the incoming task text and route accordingly.
- * 3. Ties / no signal fall back to the previous target, else local.
- *
- * Precedence with Von: deterministic escalation (1) overrides Von; Von (2) is
- * the semantic signal for AUTO and is optional — any Von failure falls through
- * to keyword classify (3).
- */
+/** AUTO requires an available candidate and a valid decision from Von. */
 async function decideTarget(
   text: string,
-  prevTarget: Target
+  ctx: ExtensionContext,
 ): Promise<{ target: Target; reason: string }> {
-  // 1. Deterministic hard escalation — overrides Von when the existing policy
-  //    clearly indicates escalation.
-  if (state.consecutiveFailures >= 3) {
-    const next =
-      prevTarget === "local"
-        ? "astra"
-        : prevTarget === "astra"
-          ? "local"
-          : "local";
-    const failures = state.consecutiveFailures;
-    state.consecutiveFailures = 0;
+  if (!getVonConfig().enabled)
     return {
-      target: next,
-      reason: `escalated after ${failures} consecutive failures`,
+      target: null,
+      reason: "Von is disabled. Enable Von or select a manual model.",
     };
-  }
-
-  // 2. Von (AUTO only). Optional; returns null on any failure so we fall through.
-  const vonResult = await vonDecision(text);
-  if (vonResult) return vonResult;
-
-  // 3. Keyword classify (existing policy, unchanged).
-  const { score } = classifyTask(text);
-  if (score >= 1) return { target: "astra", reason: "architecture/design signals" };
-  if (score <= -1) return { target: "local", reason: "implementation signals" };
-  if (prevTarget) return { target: prevTarget, reason: "no signal; kept prior target" };
-  return { target: "local", reason: "no signal; default local" };
+  const candidates = availableTargets(ctx);
+  if (!candidates.length)
+    return {
+      target: null,
+      reason:
+        "No configured routing targets are available. Configure a model in Pi.",
+    };
+  return (
+    (await evaluateVon(text, candidates)) ?? {
+      target: null,
+      reason:
+        "Von is unavailable or returned an invalid decision. Restore Von or select a manual model.",
+    }
+  );
 }
 
 /* =========================================================
@@ -391,56 +248,12 @@ function isSecuritySensitive(text: string): boolean {
 }
 
 /**
- * Gating signature: the routing INPUT signals that matter for deciding whether
- * Von should be re-evaluated. The current model (currentTarget) is deliberately
- * excluded — it is the OUTPUT of routing, not an independent signal, so its
- * change must not itself force a fresh Von call. The truncated task is included
- * so re-evaluating the same task with unchanged state reuses the decision.
+ * Build the compact snapshot and validate Von's choice. Failure selects no model.
  */
-function routingSignature(task: string): string {
-  return [
-    isSecuritySensitive(task) ? "sec" : "",
-    state.consecutiveFailures, // failure streak flips phase -> material change
-    state.toolErrors,
-    state.testFailures,
-    state.filesChanged,
-    (task || "").trim().toLowerCase().slice(0, 200),
-  ].join("|");
-}
-
-/**
- * The Von evaluation point. Called from decideTarget for AUTO only.
- *
- *   - Von disabled  -> null (pure fallback to keyword policy).
- *   - Routing state unchanged since last evaluation -> reuse last target.
- *   - Otherwise -> call Von, apply the policy engine, return a target.
- *
- * Returns null whenever Von cannot produce a decision (disabled, unavailable,
- * malformed) so decideTarget falls through to the existing keyword policy.
- */
-async function vonDecision(text: string): Promise<{ target: Target; reason: string } | null> {
-  if (!getVonConfig().enabled) return null;
-
-  const sig = routingSignature(text);
-  if (sig !== routingSignatureCache) {
-    routingSignatureCache = sig;
-    return evaluateVon(text);
-  }
-  // No material change since the last evaluation -> reuse the last decision.
-  if (lastVonTarget) {
-    return {
-      target: lastVonTarget,
-      reason: state.lastDecisionReasonVon || "von: reused decision (routing state unchanged)",
-    };
-  }
-  return null;
-}
-
-/**
- * Build the compact snapshot, call Von, and apply the local-first policy. Any
- * failure yields null so the router falls back to the keyword policy.
- */
-async function evaluateVon(text: string): Promise<{ target: Target; reason: string } | null> {
+async function evaluateVon(
+  text: string,
+  candidates: RoutingTarget[],
+): Promise<{ target: Target; reason: string } | null> {
   try {
     // Flag security-sensitive work so Von sees it as a strong escalation signal.
     if (isSecuritySensitive(text)) state.securitySensitive = true;
@@ -455,18 +268,29 @@ async function evaluateVon(text: string): Promise<{ target: Target; reason: stri
         securitySensitive: state.securitySensitive,
         currentTarget: state.currentTarget,
       },
-      text
+      text,
     );
 
-    const von = await getVonDecision(snapshot);
-    if (von === null) return null; // unavailable / malformed -> keyword fallback
+    const config = getVonConfig();
+    const criteria = Object.fromEntries(
+      candidates.map((t) => {
+        const choice = t.id.toUpperCase();
+        const override = config.criteria[choice];
+        return [
+          choice,
+          override && override !== choice ? override : t.description,
+        ];
+      }),
+    );
+    const von = await getVonDecision(snapshot, criteria);
+    if (von === null) return null;
 
     const outcome = policyEngine(von, {
-      clearAstraThreshold: getVonConfig().clearAstraThreshold,
+      choices: candidates.map((t) => t.id.toUpperCase()),
     });
+    if (outcome.decision === null) return null;
     state.lastDecisionReasonVon = outcome.reason;
-    lastVonTarget = outcome.decision === "ASTRA" ? "astra" : "local";
-    return { target: lastVonTarget, reason: outcome.reason };
+    return { target: outcome.decision.toLowerCase(), reason: outcome.reason };
   } catch {
     // Von must never crash Pi.
     return null;
@@ -480,9 +304,17 @@ async function evaluateVon(text: string): Promise<{ target: Target; reason: stri
 function setMode(mode: Mode): void {
   const was = state.mode;
   state.mode = mode;
-  if (mode === "auto") state.currentTarget = null;
+  modeRevision += 1;
+  authorizedTask = false;
+  pendingDecision = null;
   state.lastDecisionReason = `mode set to ${mode}`;
   if (was !== mode) persistState();
+}
+
+function blockAuto(reason: string): void {
+  state.lastDecisionReason = `AUTO blocked: ${reason}`;
+  persistState();
+  sendStatus(state.lastDecisionReason);
 }
 
 /**
@@ -495,23 +327,32 @@ function setMode(mode: Mode): void {
 async function applyTarget(
   ctx: ExtensionContext,
   target: Target,
-  reason: string
-): Promise<void> {
-  if (!target) return;
+  reason: string,
+): Promise<boolean> {
+  if (!target) {
+    state.lastDecisionReason = reason;
+    persistState();
+    showStatus(ctx);
+    return false;
+  }
 
   applyingRouterModel = true;
   const prev = state.currentTarget;
   try {
-    await (pi as unknown as {
-      setModel: (m: unknown) => Promise<boolean>;
-    }).setModel(targetModel(ctx, target));
+    const model = targetModel(ctx, target);
+    if (!model) throw new Error("provider/model not found in Pi's registry");
+    const switched = await pi.setModel(model);
+    if (!switched)
+      throw new Error(
+        "Pi rejected the model switch (check provider authentication)",
+      );
   } catch (err) {
     // On failure, do not pretend the switch succeeded: record the failure
     // reason and leave state.currentTarget pointing at the still-active model.
-    state.lastDecisionReason = `cannot switch to ${target}: provider not configured`;
+    state.lastDecisionReason = `cannot switch to ${describeTarget(target)}: provider not configured`;
     state.lastFailure = (err as Error)?.message || "setModel failed";
     persistState();
-    return;
+    return false;
   } finally {
     // Always release the guard once setModel() has settled.
     applyingRouterModel = false;
@@ -522,8 +363,9 @@ async function applyTarget(
   state.lastDecision = target;
   state.lastDecisionReason = reason;
   state.totalDecisions += 1;
-  recordSwitch(prev, target, reason);
+  if (prev !== target) recordSwitch(prev, target, reason);
   persistState();
+  return true;
 }
 
 /* =========================================================
@@ -531,30 +373,42 @@ async function applyTarget(
 ========================================================= */
 
 function restoreStateFromSession(ctx: ExtensionContext): void {
+  state = { ...DEFAULT_STATE, history: [] };
   try {
-    // `ctx.sessionManager.getSessionDir()` is the supported (typed) way to reach
-    // the session directory; `ctx.sessionDir` is not exposed on the type.
-    const dir = ctx.sessionManager.getSessionDir();
-    if (!dir || !existsSync(dir)) return;
-    const files = readdirSync(dir).filter((f) => f.endsWith(".jsonl"));
-    let restored: RouterState | null = null;
-    for (const file of files) {
-      const lines = readFileSync(join(dir, file), "utf-8")
-        .split("\n")
-        .map((l) => l.trim())
-        .filter(Boolean);
-      for (const line of lines) {
-        const entry = JSON.parse(line);
-        if (entry?.type === "custom" && entry?.customType === STATE_CUSTOM_TYPE) {
-          restored = entry.data;
-        }
+    // Use the active branch only, never other sessions in the same directory.
+    let restored: Partial<RouterState> | undefined;
+    for (const entry of ctx.sessionManager.getBranch()) {
+      if (
+        entry.type === "custom" &&
+        entry.customType === STATE_CUSTOM_TYPE &&
+        entry.data &&
+        typeof entry.data === "object"
+      ) {
+        restored = entry.data as Partial<RouterState>;
       }
     }
     if (restored && typeof restored.mode === "string") {
-      state = { ...DEFAULT_STATE, ...restored };
+      state = {
+        ...DEFAULT_STATE,
+        ...restored,
+        history: Array.isArray(restored.history) ? restored.history : [],
+      };
+      if (
+        state.currentTarget &&
+        !routerConfig.targets.some((t) => t.id === state.currentTarget)
+      ) {
+        state.currentTarget = null;
+      }
+      if (
+        !["auto", "manual", ...routerConfig.targets.map((t) => t.id)].includes(
+          state.mode,
+        )
+      ) {
+        state.mode = "auto";
+      }
     }
   } catch {
-    /* start from defaults */
+    // A missing or invalid session entry leaves the default routing state.
   }
 }
 
@@ -563,7 +417,7 @@ function restoreStateFromSession(ctx: ExtensionContext): void {
 ========================================================= */
 
 function describeTarget(t: Target): string {
-  return t === "local" ? "LOCAL" : t === "astra" ? "ASTRA" : "—";
+  return routerConfig.targets.find((target) => target.id === t)?.name ?? "—";
 }
 
 function buildStatusLine(): string {
@@ -581,9 +435,11 @@ function buildStatusLine(): string {
 
 function showStatus(ctx: ExtensionContext): void {
   try {
-    (pi as unknown as {
-      sendMessage: (msg: unknown) => void;
-    }).sendMessage({
+    (
+      pi as unknown as {
+        sendMessage: (msg: unknown) => void;
+      }
+    ).sendMessage({
       customType: DISPLAY_CUSTOM_TYPE,
       content: buildStatusLine(),
       display: true,
@@ -599,11 +455,14 @@ function showStatus(ctx: ExtensionContext): void {
 ========================================================= */
 
 // User (or command) selected a model from the selector.
-function handleModelSelect(event: ModelSelectEvent, ctx: ExtensionContext): void {
+function handleModelSelect(
+  event: ModelSelectEvent,
+  ctx: ExtensionContext,
+): void {
   const { model } = event;
 
   // Ignore switches we initiated ourselves.
-  if (applyingRouterModel) return;
+  if (applyingRouterModel || event.source === "restore") return;
 
   // AUTO chosen in the selector.
   if (model.provider === PROVIDER_AUTO && model.id === MODEL_AUTO) {
@@ -615,65 +474,109 @@ function handleModelSelect(event: ModelSelectEvent, ctx: ExtensionContext): void
     return;
   }
 
-  // Explicit LOCAL force.
-  if (model.provider === PROVIDER_LOCAL && model.id === MODEL_LOCAL) {
-    setMode("local");
-    state.currentTarget = "local";
-    state.lastDecision = "local";
-    state.lastDecisionReason = "user forced LOCAL";
-    persistState();
-    return;
-  }
-
-  // Explicit ASTRA force.
-  if (model.provider === PROVIDER_ASTRA && model.id === MODEL_ASTRA) {
-    setMode("astra");
-    state.currentTarget = "astra";
-    state.lastDecision = "astra";
-    state.lastDecisionReason = "user forced ASTRA";
-    persistState();
-    return;
-  }
-
-  // Any other manual selection: leave routing untouched.
+  const selected = routerConfig.targets.find(
+    (t) => t.provider === model.provider && t.model === model.id,
+  );
+  setMode(selected?.id ?? "manual");
+  state.currentTarget = selected?.id ?? null;
+  state.lastDecision = selected?.id ?? `${model.provider}/${model.id}`;
+  state.lastDecisionReason = `user selected ${selected?.name ?? state.lastDecision}`;
+  persistState();
 }
 
-// Turn boundary: reset the per-turn decision flag so the next input re-decides,
-// and drive the decision if the input event fired while the agent was busy
-// (so the switch lands before the first provider request of the turn).
-async function handleTurnStart(_event: TurnStartEvent, ctx: ExtensionContext): Promise<void> {
-  decidedThisTurn = false;
-  // New turn boundary => a fresh model-generation attempt (routing snapshot signal).
+// A deferred input was classified before queueing; apply it only at a safe boundary.
+async function handleTurnStart(
+  _event: TurnStartEvent,
+  ctx: ExtensionContext,
+): Promise<void> {
   state.attempts += 1;
   if (state.mode !== "auto") return;
-  if (decidedThisTurn) return;
-  if (!pendingInputText && state.currentTarget) return; // already decided
-  // Von is async, so await the decision before committing the switch.
-  const { target, reason } = await decideTarget(pendingInputText, state.currentTarget);
-  pendingInputText = "";
-  decidedThisTurn = true;
-  void applyTarget(ctx, target, reason);
-}
-
-// User submitted input. This is where we have the task text, so for AUTO mode
-// we decide + switch here if the agent is idle (so the switch is not torn down
-// mid-stream).
-async function handleInput(event: InputEvent, ctx: ExtensionContext): Promise<void> {
-  if (state.mode !== "auto") return;
-  if (decidedThisTurn) return; // already decided for this turn
-
-  if (ctx.isIdle()) {
-    // Von is async, so await the decision before committing the switch.
-    const { target, reason } = await decideTarget(event.text || "", state.currentTarget);
-    decidedThisTurn = true;
-    void applyTarget(ctx, target, reason);
-  } else {
-    // Agent is busy: defer the decision to the next turn boundary.
-    pendingInputText = event.text || "";
+  if (pendingDecision) {
+    const decision = pendingDecision;
+    pendingDecision = null;
+    authorizedTask = await applyTarget(ctx, decision.target, decision.reason);
+  }
+  if (!authorizedTask) {
+    blockAuto(
+      "No valid Von selection is available for this task. Resubmit the task or choose a manual model.",
+    );
+    ctx.abort();
   }
 }
 
-// Per-turn outcome tracking for escalation.
+// Consume failed AUTO inputs so Pi never starts a task on a previous/default model.
+async function handleInput(
+  event: InputEvent,
+  ctx: ExtensionContext,
+): Promise<InputEventResult | void> {
+  if (state.mode !== "auto") return;
+  if (pendingDecision) {
+    blockAuto(
+      "An AUTO task is already queued. Wait until it starts before submitting another task.",
+    );
+    return { action: "handled" };
+  }
+  const revision = modeRevision;
+  if (ctx.isIdle()) authorizedTask = false;
+  const decision = await decideTarget(event.text || "", ctx);
+  if (state.mode !== "auto") return; // A manual selection made while Von was running wins.
+  if (revision !== modeRevision) {
+    blockAuto("Routing mode changed during classification. Resubmit the task.");
+    return { action: "handled" };
+  }
+  if (!decision.target) {
+    blockAuto(decision.reason);
+    return { action: "handled" };
+  }
+  if (pendingDecision) {
+    blockAuto(
+      "An AUTO task is already queued. Wait until it starts before submitting another task.",
+    );
+    return { action: "handled" };
+  }
+  if (!ctx.isIdle()) {
+    pendingDecision = decision;
+    return;
+  }
+  authorizedTask = await applyTarget(ctx, decision.target, decision.reason);
+  if (!authorizedTask) {
+    blockAuto(
+      "Pi could not select Von's chosen model. Configure it or choose a manual model.",
+    );
+    return { action: "handled" };
+  }
+}
+
+// Covers run triggers that do not emit an input event, such as custom extension messages.
+async function handleBeforeAgentStart(
+  event: BeforeAgentStartEvent,
+  ctx: ExtensionContext,
+): Promise<void> {
+  if (state.mode !== "auto" || authorizedTask) return;
+  const revision = modeRevision;
+  const text =
+    event.messageType === "user"
+      ? event.prompt
+      : typeof event.message.content === "string"
+        ? event.message.content
+        : JSON.stringify(event.message.content);
+  const decision = pendingDecision ?? (await decideTarget(text, ctx));
+  pendingDecision = null;
+  if (state.mode !== "auto") return;
+  if (revision === modeRevision && decision.target) {
+    authorizedTask = await applyTarget(ctx, decision.target, decision.reason);
+  }
+  if (!authorizedTask) {
+    blockAuto(
+      decision.target
+        ? "Pi could not apply Von's selection. Resubmit the task or choose a manual model."
+        : decision.reason,
+    );
+    ctx.abort();
+  }
+}
+
+// Per-turn outcome tracking for Von's routing context.
 //
 // `turn_end` fires on EVERY turn — success and failure alike — carrying the
 // final assistant message. On a provider/request failure (e.g. "no credits
@@ -683,23 +586,20 @@ async function handleInput(event: InputEvent, ctx: ExtensionContext): Promise<vo
 // provider failures AND tool errors from a single, reliable event.
 function handleTurnEnd(event: TurnEndEvent): void {
   const msg = event?.message;
-  // Only a real "error" counts toward escalation. An aborted turn (user
-  // cancels) is not a provider failure and must not escalate the router.
+  if (!msg || msg.role !== "assistant") return;
+  // Only a real error advances the failure counters sent to Von; user cancellation does not.
   if (msg && msg.stopReason === "error") {
     // A context-window overflow (e.g. local llama.cpp: "68820 tokens exceeds
     // the available context size 65536") is NOT a routing failure — it is a
     // property of the current conversation, not the provider. It is therefore
-    // neutral for escalation: it neither advances the failure streak nor
-    // resets it. Escalating away would just move the same oversized context to
-    // another model, so we let the turn simply not count.
+    // neutral for failure tracking: it neither advances the failure streak nor resets it.
     if (isContextWindowError(msg)) return;
 
     state.totalFailures += 1;
     state.consecutiveFailures += 1;
     state.lastFailure = msg.errorMessage || `${msg.stopReason} during turn`;
     // Classify the failure into the routing-snapshot counters. These are
-    // diagnostic signals for Von; they never change the deterministic escalation
-    // path above. A persistent test failure and a repeated tool error are both
+    // diagnostic signals for Von. A persistent test failure and a repeated tool error are both
     // "the model is misbehaving" signals, but they are tracked separately so Von
     // can react to them distinctly.
     const why = (msg.errorMessage || msg.stopReason || "").toLowerCase();
@@ -724,7 +624,9 @@ function handleTurnEnd(event: TurnEndEvent): void {
 //   "400 request (68820 tokens) exceeds the available context size (65536 tokens)"
 // We match a small set of case-insensitive substrings so such an error is not
 // mistaken for a provider/credit failure.
-function isContextWindowError(msg: AgentMessage): boolean {
+function isContextWindowError(
+  msg: Extract<TurnEndEvent["message"], { role: "assistant" }>,
+): boolean {
   const text = (msg.errorMessage || msg.stopReason || "").toLowerCase();
   return (
     text.includes("context size") ||
@@ -738,7 +640,13 @@ function isContextWindowError(msg: AgentMessage): boolean {
 }
 
 // Session start: restore persisted routing state.
-function handleSessionStart(event: { reason: string }, ctx: ExtensionContext): void {
+function handleSessionStart(
+  event: { reason: string },
+  ctx: ExtensionContext,
+): void {
+  authorizedTask = false;
+  pendingDecision = null;
+  modeRevision += 1;
   restoreStateFromSession(ctx);
   showStatus(ctx);
 }
@@ -747,10 +655,39 @@ function handleSessionStart(event: { reason: string }, ctx: ExtensionContext): v
    SLASH COMMANDS
 ========================================================= */
 
+function sendStatus(content: string): void {
+  pi.sendMessage({ customType: DISPLAY_CUSTOM_TYPE, content, display: true });
+}
+
+async function forceTarget(
+  id: string,
+  ctx: ExtensionCommandContext,
+): Promise<void> {
+  await ctx.waitForIdle();
+  const target = routerConfig.targets.find((t) => t.id === id);
+  if (!target) {
+    sendStatus(
+      `Unknown routing target "${id}". Use /router models to list configured targets.`,
+    );
+    return;
+  }
+  if (!isTargetAvailable(ctx, id)) {
+    sendStatus(
+      `${target.name} (${target.provider}/${target.model}) is not available. Configure the model and authentication in Pi.`,
+    );
+    return;
+  }
+  if (await applyTarget(ctx, id, `command /router ${id}`)) {
+    setMode(id);
+    persistState();
+  }
+  showStatus(ctx);
+}
+
 function registerCommands(): void {
   pi.registerCommand("auto", {
-    description: "Enable automatic model routing (Pi chooses LOCAL vs ASTRA)",
-    handler: async (_args: string, ctx: ExtensionCommandContext) => {
+    description: "Enable automatic routing among configured models using Von",
+    handler: async (_args, ctx) => {
       await ctx.waitForIdle();
       setMode("auto");
       state.lastDecisionReason = "command /auto";
@@ -758,80 +695,66 @@ function registerCommands(): void {
       showStatus(ctx);
     },
   });
-
-  pi.registerCommand("local", {
-    description: "Force LOCAL model (llama.cpp) and disable auto-routing",
-    handler: async (_args: string, ctx: ExtensionCommandContext) => {
-      await ctx.waitForIdle();
-      if (!isTargetAvailable(ctx, "local")) {
-        (pi as unknown as {
-          sendMessage: (msg: unknown) => void;
-        }).sendMessage({
-          customType: DISPLAY_CUSTOM_TYPE,
-          content: "LOCAL provider/model not found in the model registry.",
-          display: true,
-        });
-        return;
-      }
-      setMode("local");
-      // Await the switch so we can report a failed switch before committing.
-      await applyTarget(ctx, "local", "command /local");
-      // If the switch failed, applyTarget recorded the failure reason; surface
-      // it so the user knows the model did not actually change.
-      if (state.lastDecisionReason.startsWith("cannot switch to LOCAL")) {
-        (pi as unknown as {
-          sendMessage: (msg: unknown) => void;
-        }).sendMessage({
-          customType: DISPLAY_CUSTOM_TYPE,
-          content: state.lastDecisionReason,
-          display: true,
-        });
-        return;
-      }
-      persistState();
-      showStatus(ctx);
-    },
-  });
-
-  pi.registerCommand("astra", {
-    description: "Force ASTRA model (openai gpt-6-astra) and disable auto-routing",
-    handler: async (_args: string, ctx: ExtensionCommandContext) => {
-      await ctx.waitForIdle();
-      if (!isTargetAvailable(ctx, "astra")) {
-        (pi as unknown as {
-          sendMessage: (msg: unknown) => void;
-        }).sendMessage({
-          customType: DISPLAY_CUSTOM_TYPE,
-          content: "ASTRA provider/model not found in the model registry.",
-          display: true,
-        });
-        return;
-      }
-      setMode("astra");
-      // Await the switch so we can report a failed switch before committing.
-      await applyTarget(ctx, "astra", "command /astra");
-      // If the switch failed, applyTarget recorded the failure reason; surface
-      // it so the user knows the model did not actually change.
-      if (state.lastDecisionReason.startsWith("cannot switch to ASTRA")) {
-        (pi as unknown as {
-          sendMessage: (msg: unknown) => void;
-        }).sendMessage({
-          customType: DISPLAY_CUSTOM_TYPE,
-          content: state.lastDecisionReason,
-          display: true,
-        });
-        return;
-      }
-      persistState();
-      showStatus(ctx);
-    },
-  });
-
+  // Preserve Pi's own command names; these aliases remain usable through /router <id>.
+  const builtinCommands = new Set([
+    "settings",
+    "model",
+    "tree",
+    "thinking",
+    "scoped-models",
+    "export",
+    "import",
+    "share",
+    "bug",
+    "copy",
+    "name",
+    "session",
+    "changelog",
+    "hotkeys",
+    "fork",
+    "clone",
+    "trust",
+    "login",
+    "logout",
+    "new",
+    "compact",
+    "resume",
+    "reload",
+    "quit",
+  ]);
+  for (const id of new Set([
+    "local",
+    "astra",
+    ...routerConfig.targets.map((t) => t.id),
+  ])) {
+    if (builtinCommands.has(id)) continue;
+    pi.registerCommand(id, {
+      description: `Force the configured ${id.toUpperCase()} target (alias for /router ${id})`,
+      handler: async (_args, ctx) => forceTarget(id, ctx),
+    });
+  }
   pi.registerCommand("router", {
-    description: "Show the current router state and last decision",
-    handler: async (_args: string, ctx: ExtensionCommandContext) => {
-      await ctx.waitForIdle();
-      showStatus(ctx);
+    description:
+      "Show status, list targets (/router models), or select one (/router <id>)",
+    handler: async (args, ctx) => {
+      const id = args.trim();
+      if (!id) {
+        await ctx.waitForIdle();
+        showStatus(ctx);
+        return;
+      }
+      if (id === "models") {
+        sendStatus(
+          routerConfig.targets
+            .map(
+              (t) =>
+                `${t.id}: ${t.name} — ${t.provider}/${t.model} (${isTargetAvailable(ctx, t.id) ? "available" : "unavailable"})`,
+            )
+            .join("\n"),
+        );
+        return;
+      }
+      await forceTarget(id, ctx);
     },
   });
 }
@@ -847,6 +770,12 @@ let pi: ExtensionAPI;
 
 export default function (extensionPi: ExtensionAPI): void {
   pi = extensionPi;
+  routerConfig = loadRouterConfig();
+  state = { ...DEFAULT_STATE, history: [] };
+  applyingRouterModel = false;
+  authorizedTask = false;
+  pendingDecision = null;
+  modeRevision = 0;
 
   // Register the virtual AUTO model so it appears in Pi's existing /model
   // selector. `registerProvider` is queued at load and flushed once the model
@@ -863,6 +792,11 @@ export default function (extensionPi: ExtensionAPI): void {
         {
           id: MODEL_AUTO,
           name: "AUTO",
+          reasoning: false,
+          input: ["text"],
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+          contextWindow: 128000,
+          maxTokens: 8192,
         },
       ],
     });
@@ -872,6 +806,10 @@ export default function (extensionPi: ExtensionAPI): void {
 
   pi.on("model_select", handleModelSelect);
   pi.on("turn_start", handleTurnStart);
+  pi.on("before_agent_start", handleBeforeAgentStart);
+  pi.on("agent_end", () => {
+    authorizedTask = false;
+  });
   pi.on("turn_end", handleTurnEnd);
   pi.on("session_start", handleSessionStart);
   pi.on("input", handleInput);
